@@ -177,6 +177,7 @@ else:
     anomaly_detection['Flow'] = (False, None)
 
 
+# 📍 13. Anomaly detection result
 print (anomaly_detection)
 {'Vibration': (True, Timestamp('2023-06-05 06:54:31')),
  'P2': (True, Timestamp('2023-06-04 19:16:54')),
