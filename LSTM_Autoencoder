@@ -1,1 +1,185 @@
+# load dataset function
+def load_data(path):
+    dataset = pd.read_excel(path, header=0, na_filter=True, na_values='Bad Input')
+    dataset = dataset.dropna()
+    print(dataset.head())
+    print('Range', dataset.index.min(), dataset.index.max())
+    return dataset
+
+
+# filter dataset by the time and normalization
+def filter_data(dataset, train_start_time, train_end_time, test_start_time, test_end_time):
+    # 1) Преобразуем Time в datetime и делаем индексом (в признаки не попадёт)
+    dataset = dataset.set_index('Time').sort_index()
+    print(dataset.head())
+
+    # 2) Выбираем интервал строк (получаем DataFrame, не Series)
+    X_train_raw = dataset.loc[train_start_time:train_end_time]
+    print(X_train_raw.shape)
+    X_test_raw = dataset.loc[test_start_time:test_end_time,:]
+    print(X_test_raw.shape)
+
+    # 3) Нормализация данных
+    scaler = StandardScaler().fit(X_train_raw)
+    X_train_scaled = scaler.transform(X_train_raw)
+    X_test_scaled = scaler.transform(X_test_raw)
+
+    print(X_test_scaled[0:3])
+    return X_train_scaled, X_test_scaled, X_train_raw, X_test_raw
+
+
+# make sliding windows
+def make_seq(X, SEQ):
+    return np.array([X[i:i+SEQ] for i in range(len(X)-SEQ+1)])
+
+
+# LSTM Autoencoder
+def train_model(X_train):
+    inp = keras.Input(shape=(SEQ, n_feats))
+    x = keras.layers.LSTM(64, return_sequences=True)(inp)
+    x = keras.layers.LSTM(32, return_sequences=False)(x)
+    x = keras.layers.RepeatVector(SEQ)(x)
+    x = keras.layers.LSTM(32, return_sequences=True)(x)
+    x = keras.layers.LSTM(64, return_sequences=True)(x)
+    out = keras.layers.TimeDistributed(keras.layers.Dense(n_feats))(x)
+    model = keras.Model(inp, out)
+    model.compile(optimizer='adam', loss='mse')
+    callbacks = [keras.callbacks.EarlyStopping(patience=1, restore_best_weights=True)]
+    model.fit(X_train, X_train, epochs=5, batch_size=128, callbacks=callbacks, validation_split=0.1, verbose=1)
+    return model
+
+
+# --- 📌 основной код ---
+# 📍 1. Загрузка данных для обучения модели
+path='//'
+dataset = load_data(path)
+print(" ✅ Data Loaded Successfully\n")
+
+
+# 📍 2. Фильтр данных и нормализация
+train_start_time = '2023-05-07 16:00:00'
+train_end_time = '2023-05-17 05:00:00'
+test_start_time = '2023-05-22 01:00:00'
+test_end_time =  '2023-06-05 11:00:00'
+X_train_scaled, X_test_scaled, X_train_raw, X_test_raw = filter_data(dataset, train_start_time, train_end_time, test_start_time, test_end_time)
+test_idx = X_test_raw.index
+test_idx = test_idx.floor('s')
+
+
+# 📍 3. Sliding window
+SEQ=120 # 120x30 sec = 60 minutes
+X_train = make_seq(X_train_scaled, SEQ)
+X_test = make_seq(X_test_scaled, SEQ)
+n_feats = X_train.shape[2]
+
+
+# 📍 4. Instatiate LSTM Autoencoder and Train
+model = train_model(X_train)
+
+
+# 📍 5. Ошибки реконструкции по каждому признаку
+#prediction
+recon_train = model.predict(X_train, verbose=0)
+recon_test = model.predict(X_test, verbose=0)
+
+#покомпонентные квадратичные ошибки (N, Q, F). Получил поэлементную квадратную ошибку (ошибку реконструкции) между входом и выходом автоэнкодера.
+err_train = (X_train - recon_train)**2
+err_test = (X_test - recon_test)**2
+
+#усредняем ошибки по временной оси окна, но не по признакам → (N, F)
+mse_train_per_feat = err_train.mean(axis=1)
+mse_test_per_feat = err_test.mean(axis=1)
+
+df = pd.DataFrame(mse_test_per_feat, columns=dataset.columns[1:])
+df.describe().transpose()
+
+
+# 📍 6. Пороги отдельно для каждого признака
+# порог как квантиль по train (например, 99.5%)
+q = 0.995
+thr_per_feat = np.quantile(mse_train_per_feat, q, axis=0)  # shape: (F,)
+# альтернатива:
+# thr_per_feat = mse_train_per_feat.mean(axis=0) + 3*mse_train_per_feat.std(axis=0)
+df_thr=pd.Series(thr_per_feat, index=dataset.columns[1:])
+
+
+# 📍 7. Привязка к времени и сбор Series по каждому сенсору. Синхронизация ошибки с временной шкалой
+feat_names = dataset.columns[1:].tolist()
+Q = X_test.shape[1]
+idx = test_idx[Q-1 : Q-1 + len(mse_test_per_feat)]  # длина = Nte - количество скользящих окон
+
+# Словари: имя признака -> Series (индекс время, значения 0/1 или score)
+anomaly_series_by_feat = {}
+mse_series_by_feat   = {}
+
+for j, name in enumerate(feat_names):
+    anomaly_series_by_feat[name] = pd.Series(mse_test_per_feat[:, j].astype(int), index=idx)
+    mse_series_by_feat[name]   = pd.Series(mse_test_per_feat[:, j], index=idx)
+
+
+# 📍 8.  Health index function for parameteres. Normalization.
+def health_index(parameter):
+  mse_series_health = mse_series_by_feat[parameter].copy()
+  HI = mse_series_health.ewm(span=96, adjust=False).mean() # smooths your anomaly scores with an exponentially weighted moving average
+
+  # normalize relative to healthy baseline (before onset)
+  baseline_window = HI.index.min(), HI.index.min() + pd.Timedelta(days=2) # baseline_window defines a 2-day interval at the very beginning of your data.
+  baseline = HI.loc[slice(*baseline_window)].quantile(0.95) #В итоге baseline = 95-й процентиль значений HI за первые два дня,
+  #который потом используется для нормализации или как порог "здоровья".
+  HI_norm = ((HI - baseline).clip(lower=0))/(HI.quantile(0.999) - baseline)
+  HI_norm = HI_norm.clip(0, 1) # normalized from 0 to 1 # turning it into a normalized score in the range [0, 1]
+  return HI_norm
+
+
+# 📍 9. health index function for parameters
+def health_index_multi(parameters):
+    HI_dict = {}
+    for param in parameters:
+        HI_dict[param] = health_index(param)
+    return HI_dict
+
+
+# 📍 10. compute health index
+Vibr =r'tag'
+P2 =  r'tag'
+Curr = r'tag'
+Flow = r'tag'
+params = [Vibr, P2, Curr, Flow]
+HI_dict = health_index_multi(params)
+
+# 📍 11. compute persist of the health index
+HI_persist = {}
+for param in params:
+  HI_persist[param] = (HI_dict[param].rolling(60, min_periods=60).mean() >= 0.8).astype(int)
+
+
+# 📍 12. compute presence of parameters anomaly detection
+anomaly_detection = {}
+
+if (HI_persist[Vibr] >= 1.0).any():
+    anomaly_detection['Vibration'] = (True, HI_persist[Vibr][HI_persist[Vibr] == 1].index[0])
+else:
+    anomaly_detection['Vibration'] = (False, None)
+
+if (HI_persist[P2] >= 1.0).any():
+    anomaly_detection['P2'] = (True, HI_persist[P2][HI_persist[P2] == 1].index[0])
+else:
+    anomaly_detection['P2'] = (False, None)
+
+if (HI_persist[Curr] >= 1.0).any():
+    anomaly_detection['Motor_Current'] = (True, HI_persist[Curr][HI_persist[Curr] == 1].index[0])
+else:
+    anomaly_detection['Motor_Current'] = (False, None)
+
+if (HI_persist[Flow] >= 1.0).any():
+    anomaly_detection['Flow'] = (True, HI_persist[Flow][HI_persist[Flow] == 1].index[0])
+else:
+    anomaly_detection['Flow'] = (False, None)
+
+
+print (anomaly_detection)
+{'Vibration': (True, Timestamp('2023-06-05 06:54:31')),
+ 'P2': (True, Timestamp('2023-06-04 19:16:54')),
+ 'Motor_Current': (True, Timestamp('2023-06-04 19:14:54')),
+ 'Flow': (True, Timestamp('2023-06-04 19:19:24'))}
 
