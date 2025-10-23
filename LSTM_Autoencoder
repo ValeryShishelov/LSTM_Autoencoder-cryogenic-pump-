@@ -9,17 +9,17 @@ def load_data(path):
 
 # filter dataset by the time and normalization
 def filter_data(dataset, train_start_time, train_end_time, test_start_time, test_end_time):
-    # 1) Преобразуем Time в datetime и делаем индексом (в признаки не попадёт)
+    # 1) Convert 'Time' column to datetime and set it as index (it will not be included as a feature)
     dataset = dataset.set_index('Time').sort_index()
     print(dataset.head())
 
-    # 2) Выбираем интервал строк (получаем DataFrame, не Series)
+    # 2) Select time intervals (returns DataFrame, not Series)
     X_train_raw = dataset.loc[train_start_time:train_end_time]
     print(X_train_raw.shape)
     X_test_raw = dataset.loc[test_start_time:test_end_time,:]
     print(X_test_raw.shape)
 
-    # 3) Нормализация данных
+    # 3) Normalize the data using StandardScaler
     scaler = StandardScaler().fit(X_train_raw)
     X_train_scaled = scaler.transform(X_train_raw)
     X_test_scaled = scaler.transform(X_test_raw)
