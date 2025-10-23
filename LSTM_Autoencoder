@@ -49,14 +49,14 @@ def train_model(X_train):
     return model
 
 
-# --- 📌 основной код ---
-# 📍 1. Загрузка данных для обучения модели
+# --- 📌 Main code ---
+# 📍 1. Load Dataset
 path='//'
 dataset = load_data(path)
 print(" ✅ Data Loaded Successfully\n")
 
 
-# 📍 2. Фильтр данных и нормализация. Выбор периода обучения модели при нормальной работе насоса. И выбор периода мониторинга аномалий в работе насоса.
+# 📍 2. Data filtering and normalization. Select the train period during normal pump operation. Select the period for monitoring pump anomalies.
 train_start_time = '2023-05-07 16:00:00'
 train_end_time = '2023-05-17 05:00:00'
 test_start_time = '2023-05-22 01:00:00'
@@ -66,7 +66,7 @@ test_idx = X_test_raw.index
 test_idx = test_idx.floor('s')
 
 
-# 📍 3. Sliding window. Врменное окно энкодера, 120 срезов = 60 минут. 
+# 📍 3. Sliding window. Time window for encoder, 120 samples = 60 minutes. 
 SEQ=120 # 120x30 sec = 60 minutes
 X_train = make_seq(X_train_scaled, SEQ)
 X_test = make_seq(X_test_scaled, SEQ)
@@ -77,16 +77,16 @@ n_feats = X_train.shape[2]
 model = train_model(X_train)
 
 
-# 📍 5. Ошибки реконструкции по каждому параметру и краткая статистика. MSE error
+# 📍 5. MSE error for each feature and statistics.
 #prediction
 recon_train = model.predict(X_train, verbose=0)
 recon_test = model.predict(X_test, verbose=0)
 
-#покомпонентные квадратичные ошибки (N, Q, F). Получил поэлементную квадратную ошибку (ошибку реконструкции) между входом и выходом автоэнкодера.
+#feature MSE (N, Q, F).
 err_train = (X_train - recon_train)**2
 err_test = (X_test - recon_test)**2
 
-#усредняем ошибки по временной оси окна, но не по признакам → (N, F)
+#average MSE on window time
 mse_train_per_feat = err_train.mean(axis=1)
 mse_test_per_feat = err_test.mean(axis=1)
 
@@ -94,21 +94,21 @@ df = pd.DataFrame(mse_test_per_feat, columns=dataset.columns[1:])
 df.describe().transpose()
 
 
-# 📍 6. Пороги отдельно для каждого признака
-# порог как квантиль по train (например, 99.5%)
+# 📍 6. Threshold separately for each feature
+# quantile on train (99.5%)
 q = 0.995
 thr_per_feat = np.quantile(mse_train_per_feat, q, axis=0)  # shape: (F,)
-# альтернатива:
+# alternative:
 # thr_per_feat = mse_train_per_feat.mean(axis=0) + 3*mse_train_per_feat.std(axis=0)
 df_thr=pd.Series(thr_per_feat, index=dataset.columns[1:])
 
 
-# 📍 7. Привязка к времени и сбор Series по каждому сенсору. Синхронизация ошибки с временной шкалой
+# 📍 7. Time alignment and assembling Series for each sensor. Synchronizing errors with the time axis
 feat_names = dataset.columns[1:].tolist()
 Q = X_test.shape[1]
-idx = test_idx[Q-1 : Q-1 + len(mse_test_per_feat)]  # длина = Nte - количество скользящих окон
+idx = test_idx[Q-1 : Q-1 + len(mse_test_per_feat)]   # length = Nte - number of sliding windows
 
-# Словари: имя признака -> Series (индекс время, значения 0/1 или score)
+# Dictionaries: feature name -> Series (time index, values = 0/1 or score)
 anomaly_series_by_feat = {}
 mse_series_by_feat   = {}
 
@@ -117,14 +117,20 @@ for j, name in enumerate(feat_names):
     mse_series_by_feat[name]   = pd.Series(mse_test_per_feat[:, j], index=idx)
 
 
-# 📍 8.  Health index function for parameteres.
+# 📍 8.  Health Index function for each parameter
 def health_index(parameter):
   mse_series_health = mse_series_by_feat[parameter].copy()
-  HI = mse_series_health.ewm(span=96, adjust=False).mean() # smooths your anomaly scores with an exponentially weighted moving average
 
-  # normalize relative to healthy baseline (before onset)
-  baseline_window = HI.index.min(), HI.index.min() + pd.Timedelta(days=2) # baseline_window defines a 2-day interval at the very beginning of your data.
-  baseline = HI.loc[slice(*baseline_window)].quantile(0.95) #В итоге baseline = 95-й процентиль значений HI за первые два дня, который потом используется для нормализации или как порог "здоровья".
+  # Smooth anomaly scores using exponentially weighted moving average (EWMA)
+  HI = mse_series_health.ewm(span=96, adjust=False).mean()
+
+  # Normalize relative to a healthy baseline (before onset)
+  baseline_window = HI.index.min(), HI.index.min() + pd.Timedelta(days=2) 
+  # baseline_window defines a 2-day interval at the very beginning of your data.
+
+  baseline = HI.loc[slice(*baseline_window)].quantile(0.95)
+  # baseline = 95th percentile of HI during the first 2 days (used as a health threshold)
+
   HI_norm = ((HI - baseline).clip(lower=0))/(HI.quantile(0.999) - baseline)
   HI_norm = HI_norm.clip(0, 1) # normalized from 0 to 1 # turning it into a normalized score in the range [0, 1]
   return HI_norm
