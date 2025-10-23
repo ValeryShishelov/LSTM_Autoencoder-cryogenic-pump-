@@ -56,7 +56,7 @@ dataset = load_data(path)
 print(" ✅ Data Loaded Successfully\n")
 
 
-# 📍 2. Фильтр данных и нормализация
+# 📍 2. Фильтр данных и нормализация. Выбор периода обучения модели при нормальной работе насоса. И выбор периода мониторинга аномалий в работе насоса.
 train_start_time = '2023-05-07 16:00:00'
 train_end_time = '2023-05-17 05:00:00'
 test_start_time = '2023-05-22 01:00:00'
@@ -66,7 +66,7 @@ test_idx = X_test_raw.index
 test_idx = test_idx.floor('s')
 
 
-# 📍 3. Sliding window
+# 📍 3. Sliding window. Врменное окно энкодера, 120 срезов = 60 минут. 
 SEQ=120 # 120x30 sec = 60 minutes
 X_train = make_seq(X_train_scaled, SEQ)
 X_test = make_seq(X_test_scaled, SEQ)
@@ -77,7 +77,7 @@ n_feats = X_train.shape[2]
 model = train_model(X_train)
 
 
-# 📍 5. Ошибки реконструкции по каждому признаку
+# 📍 5. Ошибки реконструкции по каждому параметру и краткая статистика. MSE error
 #prediction
 recon_train = model.predict(X_train, verbose=0)
 recon_test = model.predict(X_test, verbose=0)
@@ -117,15 +117,14 @@ for j, name in enumerate(feat_names):
     mse_series_by_feat[name]   = pd.Series(mse_test_per_feat[:, j], index=idx)
 
 
-# 📍 8.  Health index function for parameteres. Normalization.
+# 📍 8.  Health index function for parameteres.
 def health_index(parameter):
   mse_series_health = mse_series_by_feat[parameter].copy()
   HI = mse_series_health.ewm(span=96, adjust=False).mean() # smooths your anomaly scores with an exponentially weighted moving average
 
   # normalize relative to healthy baseline (before onset)
   baseline_window = HI.index.min(), HI.index.min() + pd.Timedelta(days=2) # baseline_window defines a 2-day interval at the very beginning of your data.
-  baseline = HI.loc[slice(*baseline_window)].quantile(0.95) #В итоге baseline = 95-й процентиль значений HI за первые два дня,
-  #который потом используется для нормализации или как порог "здоровья".
+  baseline = HI.loc[slice(*baseline_window)].quantile(0.95) #В итоге baseline = 95-й процентиль значений HI за первые два дня, который потом используется для нормализации или как порог "здоровья".
   HI_norm = ((HI - baseline).clip(lower=0))/(HI.quantile(0.999) - baseline)
   HI_norm = HI_norm.clip(0, 1) # normalized from 0 to 1 # turning it into a normalized score in the range [0, 1]
   return HI_norm
